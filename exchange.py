@@ -51,7 +51,7 @@ class ExchangeClient:
             
             # Get the current time for accurate calculation
             now = int(time.time() * 1000)  # Current time in milliseconds
-            one_hour_ago = now - (60 * 60 * 1000)  # One hour ago in milliseconds
+            one_hour_ago = now - (2* 60 * 60 * 1000)  # two hour ago in milliseconds
             
             # Limit processing to top 100 by volume initially to avoid excessive API calls
             pre_filtered_symbols = sorted(
@@ -60,7 +60,7 @@ class ExchangeClient:
                 reverse=True
             )[:100]  # Pre-limit to top 100 by volume
             
-            logger.info(f"Calculating 1hr rolling price gains for {len(pre_filtered_symbols)} markets")
+            logger.info(f"Calculating 2hr rolling price gains for {len(pre_filtered_symbols)} markets")
             
             # For each market, calculate price change
             for symbol in pre_filtered_symbols:
@@ -118,7 +118,7 @@ class ExchangeClient:
             
             # Log the top symbols with their price change percentage
             for i, symbol in enumerate(top_symbols[:10]):  # Log just top 10 for brevity
-                logger.info(f"{i+1}. {symbol}: 1hr Price Change: {price_changes[symbol]:.2f}%")
+                logger.info(f"{i+1}. {symbol}: 2hr Price Change: {price_changes[symbol]:.2f}%")
             
             return top_symbols
         
