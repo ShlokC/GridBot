@@ -3,7 +3,9 @@ from tkinter import ttk, messagebox
 import json
 import threading
 import time
+import math
 from exchange import ExchangeClient
+from grid_logic import GridBot
 
 class GridBotApp:
     def __init__(self, root):
@@ -30,8 +32,15 @@ class GridBotApp:
         # Trading symbol
         self.symbol = tk.StringVar()
         
+        # Grid spacing percentage (0.3-0.6%)
+        self.grid_spacing_pct = 0.005  # Default to 0.5%
+        
         # Initialize exchange client
         self.exchange_client = ExchangeClient()
+        
+        # Support and resistance levels
+        self.support_levels = []
+        self.resistance_levels = []
         
         # Create UI sections
         self.create_symbol_section()
@@ -171,6 +180,9 @@ class GridBotApp:
         # Set text color to normal (not placeholder color)
         self.lower_price.config(fg=self.lower_price.default_fg_color)
         self.upper_price.config(fg=self.upper_price.default_fg_color)
+        
+        # Calculate optimal grid number
+        self.calculate_optimal_grid_number(lower_price, upper_price)
     
     def create_direction_buttons(self):
         # Direction buttons frame
@@ -225,12 +237,14 @@ class GridBotApp:
         title_label = tk.Label(title_frame, text="1. Price Range", bg=self.bg_color, fg=self.text_color, anchor='w')
         title_label.pack(side=tk.LEFT)
         
-        trailing_label = tk.Label(title_frame, text="Trailing", bg=self.bg_color, fg=self.highlight_color, anchor='w')
-        trailing_label.pack(side=tk.LEFT, padx=5)
+        self.trailing_label = tk.Label(title_frame, text="Trailing", bg=self.bg_color, fg=self.highlight_color, anchor='w')
+        self.trailing_label.pack(side=tk.LEFT, padx=5)
         
-        # Auto Fill on right
-        auto_fill = tk.Label(title_frame, text="Auto Fill", bg=self.bg_color, fg=self.highlight_color, anchor='e')
-        auto_fill.pack(side=tk.RIGHT)
+        # Auto Fill on right with clickable behavior
+        self.auto_fill_label = tk.Label(title_frame, text="Auto Fill", bg=self.bg_color, fg=self.highlight_color, 
+                                      anchor='e', cursor="hand2")
+        self.auto_fill_label.pack(side=tk.RIGHT)
+        self.auto_fill_label.bind("<Button-1>", self.auto_fill_support_resistance)
         
         # Price inputs
         price_frame = tk.Frame(frame, bg=self.bg_color)
@@ -244,16 +258,138 @@ class GridBotApp:
                                   width=15, bd=1, highlightbackground=self.border_color)
         self.upper_price.pack(side=tk.RIGHT, expand=True, fill=tk.X, padx=(2, 0))
     
-    # [Rest of your existing methods...]
-    # [I've omitted them for brevity but they remain unchanged]
-
+    
+    def auto_fill_support_resistance(self, event=None):
+        """Fetch accurate support and resistance levels and update price range"""
+        selected_symbol = self.symbol.get()
+        if not selected_symbol or selected_symbol == "Loading symbols..." or selected_symbol == "Error loading symbols":
+            messagebox.showerror("Error", "Please select a valid trading symbol first")
+            return
+        
+        # Show loading indicator
+        self.auto_fill_label.config(text="Loading...")
+        
+        # Start a thread to fetch levels in background
+        threading.Thread(
+            target=self._fetch_support_resistance_thread,
+            args=(selected_symbol,),
+            daemon=True
+        ).start()
+    
+    def _fetch_support_resistance_thread(self, symbol):
+        """Background thread to fetch accurate support and resistance levels"""
+        try:
+            # Get current price to focus our level search
+            ticker = self.exchange_client.fetch_ticker(symbol)
+            current_price = ticker['last'] if ticker and 'last' in ticker else None
+            
+            if not current_price:
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Error", "Failed to fetch current price"))
+                self.root.after(0, lambda: self.auto_fill_label.config(text="Auto Fill"))
+                return
+            
+            # Create a temporary GridBot instance to analyze the market
+            config = {
+                'symbol': symbol,
+                'direction': self.direction.get(),
+                'price_range': {
+                    'lower': 0,
+                    'upper': 0
+                },
+                'grid': {
+                    'number': 10,
+                    'type': 'Arithmetic'
+                },
+                'investment': {
+                    'currency': 'USDT',
+                    'leverage': '1x',
+                    'amount': 1
+                }
+            }
+            
+            grid_bot = GridBot(config, self.exchange_client)
+            
+            # Use the improved support/resistance detection
+            support_levels, resistance_levels = grid_bot.analyze_market(timeframe='5m', limit=200)
+            
+            if support_levels and resistance_levels:
+                # We should now have accurate levels
+                lower_price = support_levels[0]  # First support level
+                upper_price = resistance_levels[0]  # First resistance level
+                
+                # Calculate distance from current price as percentage
+                lower_distance_pct = (current_price - lower_price) / current_price * 100
+                upper_distance_pct = (upper_price - current_price) / current_price * 100
+                
+                # Ensure minimum range of 2%
+                min_range_pct = 2.0
+                total_range_pct = lower_distance_pct + upper_distance_pct
+                
+                if total_range_pct < min_range_pct:
+                    # Expand the range proportionally
+                    expand_factor = min_range_pct / total_range_pct
+                    lower_price = current_price - (current_price - lower_price) * expand_factor
+                    upper_price = current_price + (upper_price - current_price) * expand_factor
+                
+                # Save the levels for later use
+                self.support_levels = support_levels
+                self.resistance_levels = resistance_levels
+                
+                # Update UI on main thread
+                self.root.after(0, lambda: self.update_price_fields(lower_price, upper_price))
+                self.root.after(0, lambda: self.auto_fill_label.config(text="Auto Fill"))
+                
+                # Prepare detailed message
+                support_msg = f"Support: {lower_price:.6f} ({lower_distance_pct:.2f}% below current)"
+                resistance_msg = f"Resistance: {upper_price:.6f} ({upper_distance_pct:.2f}% above current)"
+                
+                # Display additional levels if available
+                additional_levels = ""
+                if len(support_levels) > 1 or len(resistance_levels) > 1:
+                    additional_levels = "\n\nAdditional levels:"
+                    
+                    if len(support_levels) > 1:
+                        additional_levels += "\nSupport: " + ", ".join([f"{level:.6f}" for level in support_levels[1:]])
+                    
+                    if len(resistance_levels) > 1:
+                        additional_levels += "\nResistance: " + ", ".join([f"{level:.6f}" for level in resistance_levels[1:]])
+                
+                level_msg = f"Detected accurate support and resistance levels:\n\n{support_msg}\n{resistance_msg}{additional_levels}"
+                
+                self.root.after(0, lambda: messagebox.showinfo("Support & Resistance Levels", level_msg))
+            else:
+                # No levels found, use default
+                lower_price = current_price * 0.97
+                upper_price = current_price * 1.03
+                
+                # Update UI
+                self.root.after(0, lambda: self.update_price_fields(lower_price, upper_price))
+                self.root.after(0, lambda: self.auto_fill_label.config(text="Auto Fill"))
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Using Default Range", "No clear support/resistance found. Using default ±3% range."))
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror(
+                "Error", f"Failed to detect support/resistance: {str(e)}"))
+            self.root.after(0, lambda: self.auto_fill_label.config(text="Auto Fill"))
+    
     def create_grid_section(self):
         # Frame for grid section
         frame = tk.Frame(self.root, bg=self.bg_color, padx=10, pady=5)
         frame.pack(fill=tk.X)
         
-        # Title
-        tk.Label(frame, text="2. Number of Grids", bg=self.bg_color, fg=self.text_color, anchor='w').pack(fill=tk.X)
+        # Title with auto-calculate hint
+        title_frame = tk.Frame(frame, bg=self.bg_color)
+        title_frame.pack(fill=tk.X)
+        
+        tk.Label(title_frame, text="2. Number of Grids", bg=self.bg_color, 
+                fg=self.text_color, anchor='w').pack(side=tk.LEFT)
+        
+        # Auto-calculate label on right
+        self.auto_grid_label = tk.Label(title_frame, text="Auto", bg=self.bg_color, 
+                                      fg=self.highlight_color, anchor='e', cursor="hand2")
+        self.auto_grid_label.pack(side=tk.RIGHT)
+        self.auto_grid_label.bind("<Button-1>", self.calculate_grid_number)
         
         # Grid inputs
         grid_frame = tk.Frame(frame, bg=self.bg_color)
@@ -266,6 +402,14 @@ class GridBotApp:
         self.grid_type.pack(side=tk.RIGHT, padx=(2, 0))
         self.grid_type.set("Arithmetic")
         
+        # Grid spacing info
+        spacing_frame = tk.Frame(frame, bg=self.bg_color)
+        spacing_frame.pack(fill=tk.X)
+        
+        self.grid_spacing_label = tk.Label(spacing_frame, text="Grid Spacing: ~0.5%", 
+                                        bg=self.bg_color, fg=self.text_color, anchor='w')
+        self.grid_spacing_label.pack(side=tk.LEFT)
+        
         # Profit display
         profit_frame = tk.Frame(frame, bg=self.bg_color)
         profit_frame.pack(fill=tk.X, pady=5)
@@ -273,8 +417,194 @@ class GridBotApp:
         tk.Label(profit_frame, text="Profit (incl fees deducted)", bg=self.bg_color, 
                fg=self.text_color, anchor='w').pack(side=tk.LEFT)
         
-        tk.Label(profit_frame, text="--", bg=self.bg_color, 
-               fg=self.text_color, anchor='e').pack(side=tk.RIGHT)
+        self.profit_label = tk.Label(profit_frame, text="--", bg=self.bg_color, 
+                                   fg=self.text_color, anchor='e')
+        self.profit_label.pack(side=tk.RIGHT)
+        
+        # Bind grid number changes to update spacing
+        self.grid_number.bind("<KeyRelease>", self.update_grid_spacing)
+    
+    def calculate_grid_number(self, event=None):
+        """Calculate optimal grid number based on price range and desired spacing"""
+        try:
+            # Get current price range
+            lower_price_str = self.get_value(self.lower_price)
+            upper_price_str = self.get_value(self.upper_price)
+            
+            if not lower_price_str or not upper_price_str:
+                messagebox.showerror("Error", "Please set price range first")
+                return
+            
+            lower_price = float(lower_price_str)
+            upper_price = float(upper_price_str)
+            
+            # Calculate optimal grid number based on 0.3-0.6% spacing
+            self.calculate_optimal_grid_number(lower_price, upper_price)
+            
+        except ValueError:
+            messagebox.showerror("Error", "Invalid price values")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to calculate grid number: {str(e)}")
+    
+    def calculate_optimal_grid_number(self, event=None):
+        """Calculate optimal grid number based on detected support/resistance levels"""
+        try:
+            # Get the selected symbol
+            selected_symbol = self.symbol.get()
+            if not selected_symbol or selected_symbol == "Loading symbols..." or selected_symbol == "Error loading symbols":
+                messagebox.showerror("Error", "Please select a valid trading symbol first")
+                return
+            
+            # Show loading indicator
+            self.grid_spacing_label.config(text="Calculating...")
+            
+            # Create a temporary GridBot instance to analyze the market
+            config = {
+                'symbol': selected_symbol,
+                'direction': self.direction.get(),
+                'price_range': {
+                    'lower': 0,
+                    'upper': 0
+                },
+                'grid': {
+                    'number': 10,
+                    'type': 'Arithmetic'
+                },
+                'investment': {
+                    'currency': 'USDT',
+                    'leverage': '1x',
+                    'amount': 1
+                }
+            }
+            
+            grid_bot = GridBot(config, self.exchange_client)
+            
+            # Get support and resistance levels
+            support_levels, resistance_levels = grid_bot.analyze_market(timeframe='5m', limit=200)
+            
+            # Get current price
+            ticker = self.exchange_client.fetch_ticker(selected_symbol)
+            current_price = ticker['last'] if ticker and 'last' in ticker else None
+            
+            if not current_price:
+                messagebox.showerror("Error", "Failed to fetch current price")
+                return
+                
+            if support_levels and resistance_levels:
+                # Use the closest support and resistance levels
+                lower_price = max([s for s in support_levels if s < current_price], default=current_price * 0.97)
+                upper_price = min([r for r in resistance_levels if r > current_price], default=current_price * 1.03)
+                
+                # Update price fields first
+                self.lower_price.delete(0, tk.END)
+                self.upper_price.delete(0, tk.END)
+                self.lower_price.insert(0, f"{lower_price:.8f}")
+                self.upper_price.insert(0, f"{upper_price:.8f}")
+                self.lower_price.config(fg=self.lower_price.default_fg_color)
+                self.upper_price.config(fg=self.upper_price.default_fg_color)
+                
+                # Now calculate optimal grid number based on this range
+                price_diff_pct = (upper_price - lower_price) / lower_price
+                
+                # Adjust grid spacing based on volatility
+                if price_diff_pct > 0.10:  # >10% range
+                    self.grid_spacing_pct = 0.006  # 0.6% spacing
+                elif price_diff_pct > 0.05:  # 5-10% range
+                    self.grid_spacing_pct = 0.005  # 0.5% spacing
+                else:  # < 5% range
+                    self.grid_spacing_pct = 0.003  # 0.3% spacing
+                
+                # Calculate number of grids
+                num_grids = round(price_diff_pct / self.grid_spacing_pct)
+                num_grids = max(4, min(num_grids, 100))  # Ensure reasonable limits
+                
+                # Calculate actual spacing percentage
+                actual_spacing_pct = price_diff_pct / num_grids
+                
+                # Update grid number field
+                self.grid_number.delete(0, tk.END)
+                self.grid_number.insert(0, str(num_grids))
+                self.grid_number.config(fg=self.grid_number.default_fg_color)
+                
+                # Update spacing label
+                self.grid_spacing_label.config(text=f"Grid Spacing: ~{actual_spacing_pct*100:.2f}%")
+                
+                # Update profit estimate
+                self.update_profit_estimate(lower_price, upper_price, num_grids)
+                
+                # Show success message
+                messagebox.showinfo("Grid Settings", 
+                                f"Price range set to support/resistance levels:\n"
+                                f"Support: {lower_price:.6f}\n"
+                                f"Resistance: {upper_price:.6f}\n"
+                                f"Optimal grid number: {num_grids}")
+            else:
+                messagebox.showinfo("No Levels Found", 
+                                "No clear support/resistance levels detected. "
+                                "Please set price range manually.")
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to calculate grid settings: {str(e)}")
+            self.grid_spacing_label.config(text="Grid Spacing: ~0.5%")  # Reset label
+        
+    def update_grid_spacing(self, event=None):
+        """Update grid spacing label when grid number changes"""
+        try:
+            # Get current values
+            grid_num_str = self.get_value(self.grid_number)
+            lower_price_str = self.get_value(self.lower_price)
+            upper_price_str = self.get_value(self.upper_price)
+            
+            if not grid_num_str or not lower_price_str or not upper_price_str:
+                return
+            
+            grid_num = int(grid_num_str)
+            lower_price = float(lower_price_str)
+            upper_price = float(upper_price_str)
+            
+            if grid_num <= 0:
+                return
+                
+            # Calculate actual spacing percentage
+            price_diff_pct = (upper_price - lower_price) / lower_price
+            actual_spacing_pct = price_diff_pct / grid_num
+            
+            # Update spacing label
+            self.grid_spacing_label.config(text=f"Grid Spacing: ~{actual_spacing_pct*100:.2f}%")
+            
+            # Update profit estimate
+            self.update_profit_estimate(lower_price, upper_price, grid_num)
+            
+        except (ValueError, ZeroDivisionError):
+            # Invalid input, just ignore
+            pass
+        except Exception as e:
+            print(f"Error updating grid spacing: {e}")
+    
+    def update_profit_estimate(self, lower_price, upper_price, grid_num):
+        """Update the profit estimate based on price range and grid number"""
+        try:
+            # Simple profit estimate calculation (grid trading profit)
+            # For each completed grid cycle, profit is approximately the grid spacing
+            # Assuming 1 full cycle and a 0.1% fee per trade
+            
+            # Calculate grid spacing in percentage
+            grid_spacing_pct = ((upper_price - lower_price) / lower_price) / grid_num
+            
+            # Profit per complete grid cycle (buy and sell across each grid)
+            # Deduct fees (0.1% per trade, 2 trades per grid)
+            fee_percentage = 0.001  # 0.1% fee per trade
+            profit_percentage = grid_spacing_pct - (2 * fee_percentage)
+            
+            # Total profit for one complete cycle through all grids
+            total_profit_pct = profit_percentage * grid_num
+            
+            # Update profit label
+            self.profit_label.config(text=f"{total_profit_pct*100:.2f}%")
+            
+        except Exception as e:
+            print(f"Error updating profit estimate: {e}")
+            self.profit_label.config(text="--")
     
     def create_investment_section(self):
         # Frame for investment section
@@ -317,12 +647,16 @@ class GridBotApp:
             ("Margin Mode", "Isolated")
         ]
         
+        self.info_values = {}
+        
         for i, (label, value) in enumerate(info_labels):
             row = tk.Frame(info_frame, bg=self.bg_color)
             row.pack(fill=tk.X, pady=2)
             
             tk.Label(row, text=label, bg=self.bg_color, fg=self.text_color, anchor='w').pack(side=tk.LEFT)
-            tk.Label(row, text=value, bg=self.bg_color, fg=self.text_color, anchor='e').pack(side=tk.RIGHT)
+            value_label = tk.Label(row, text=value, bg=self.bg_color, fg=self.text_color, anchor='e')
+            value_label.pack(side=tk.RIGHT)
+            self.info_values[label] = value_label
     
     def create_advanced_section(self):
         # Frame for advanced section
@@ -658,11 +992,30 @@ class GridBotApp:
             }
         }
         
-        # Print config for now (will be passed to grid_logic.py to create and start the bot)
-        print(json.dumps(config, indent=2))
-        
-        # TODO: Pass to grid_logic.py to create and start the bot
-        messagebox.showinfo("Bot Created", f"Grid Bot for {symbol} created successfully!")
+        # Create GridBot instance
+        try:
+            # Validate required fields
+            if not config["price_range"]["lower"] or not config["price_range"]["upper"]:
+                messagebox.showerror("Error", "Please set the price range")
+                return
+                
+            if not config["grid"]["number"]:
+                messagebox.showerror("Error", "Please set the number of grids")
+                return
+                
+            # Create the grid bot using grid_logic.py
+            grid_bot = GridBot(config, self.exchange_client)
+            
+            # Start the bot
+            success = grid_bot.start()
+            
+            if success:
+                messagebox.showinfo("Bot Created", f"Grid Bot for {symbol} created successfully!")
+            else:
+                messagebox.showerror("Error", "Failed to start the grid bot")
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Error creating bot: {str(e)}")
 
 def main():
     root = tk.Tk()
