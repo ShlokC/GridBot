@@ -182,7 +182,7 @@ class GridBotApp:
         self.upper_price.config(fg=self.upper_price.default_fg_color)
         
         # Calculate optimal grid number
-        self.calculate_optimal_grid_number(lower_price, upper_price)
+        self.calculate_optimal_grid_number()  # Change this line - don't pass parameters
     
     def create_direction_buttons(self):
         # Direction buttons frame
@@ -495,7 +495,11 @@ class GridBotApp:
                 lower_price = max([s for s in support_levels if s < current_price], default=current_price * 0.97)
                 upper_price = min([r for r in resistance_levels if r > current_price], default=current_price * 1.03)
                 
-                # Update price fields first
+                # Save the levels for later use
+                self.support_levels = support_levels
+                self.resistance_levels = resistance_levels
+                
+                # Update price fields with the detected support/resistance levels
                 self.lower_price.delete(0, tk.END)
                 self.upper_price.delete(0, tk.END)
                 self.lower_price.insert(0, f"{lower_price:.8f}")
@@ -532,21 +536,43 @@ class GridBotApp:
                 # Update profit estimate
                 self.update_profit_estimate(lower_price, upper_price, num_grids)
                 
-                # Show success message
-                messagebox.showinfo("Grid Settings", 
-                                f"Price range set to support/resistance levels:\n"
-                                f"Support: {lower_price:.6f}\n"
-                                f"Resistance: {upper_price:.6f}\n"
-                                f"Optimal grid number: {num_grids}")
+                # Since we've just done a full calculation and update, don't show a separate message
+                # in this context - the UI has been updated with all calculated values
             else:
-                messagebox.showinfo("No Levels Found", 
-                                "No clear support/resistance levels detected. "
-                                "Please set price range manually.")
+                # If no support/resistance found, use default values
+                lower_price = current_price * 0.97
+                upper_price = current_price * 1.03
+                
+                # Update price fields
+                self.lower_price.delete(0, tk.END)
+                self.upper_price.delete(0, tk.END)
+                self.lower_price.insert(0, f"{lower_price:.8f}")
+                self.upper_price.insert(0, f"{upper_price:.8f}")
+                self.lower_price.config(fg=self.lower_price.default_fg_color)
+                self.upper_price.config(fg=self.upper_price.default_fg_color)
+                
+                # Calculate a default grid number
+                price_diff_pct = (upper_price - lower_price) / lower_price
+                num_grids = round(price_diff_pct / 0.005)  # Use default 0.5% spacing
+                num_grids = max(4, min(num_grids, 50))
+                
+                # Update grid number field
+                self.grid_number.delete(0, tk.END)
+                self.grid_number.insert(0, str(num_grids))
+                self.grid_number.config(fg=self.grid_number.default_fg_color)
+                
+                # Update spacing label
+                actual_spacing_pct = price_diff_pct / num_grids
+                self.grid_spacing_label.config(text=f"Grid Spacing: ~{actual_spacing_pct*100:.2f}%")
+                
+                # Update profit estimate
+                self.update_profit_estimate(lower_price, upper_price, num_grids)
+                
+                messagebox.showinfo("Using Default Range", "No clear support/resistance found. Using default ±3% range.")
                 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to calculate grid settings: {str(e)}")
             self.grid_spacing_label.config(text="Grid Spacing: ~0.5%")  # Reset label
-        
     def update_grid_spacing(self, event=None):
         """Update grid spacing label when grid number changes"""
         try:
