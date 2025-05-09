@@ -451,7 +451,7 @@ class GridBotApp:
         try:
             # Get the selected symbol
             selected_symbol = self.symbol.get()
-            if not selected_symbol or selected_symbol == "Loading symbols..." or selected_symbol == "Error loading symbols":
+            if not selected_symbol or selected_symbol == "Loading symbols...":
                 messagebox.showerror("Error", "Please select a valid trading symbol first")
                 return
             
@@ -462,25 +462,15 @@ class GridBotApp:
             config = {
                 'symbol': selected_symbol,
                 'direction': self.direction.get(),
-                'price_range': {
-                    'lower': 0,
-                    'upper': 0
-                },
-                'grid': {
-                    'number': 10,
-                    'type': 'Arithmetic'
-                },
-                'investment': {
-                    'currency': 'USDT',
-                    'leverage': '1x',
-                    'amount': 1
-                }
+                'price_range': {'lower': 0, 'upper': 0},
+                'grid': {'number': 10, 'type': 'Arithmetic'},
+                'investment': {'currency': 'USDT', 'leverage': '1x', 'amount': 1}
             }
             
             grid_bot = GridBot(config, self.exchange_client)
             
             # Get support and resistance levels
-            support_levels, resistance_levels = grid_bot.analyze_market(timeframe='5m', limit=200)
+            all_support_levels, all_resistance_levels = grid_bot.analyze_market(timeframe='5m', limit=200)
             
             # Get current price
             ticker = self.exchange_client.fetch_ticker(selected_symbol)
@@ -489,90 +479,120 @@ class GridBotApp:
             if not current_price:
                 messagebox.showerror("Error", "Failed to fetch current price")
                 return
+            
+            # Find the optimal support and resistance levels
+            if all_support_levels and all_resistance_levels:
+                # Filter support and resistance levels
+                support_levels = [s for s in all_support_levels if s < current_price]
+                resistance_levels = [r for r in all_resistance_levels if r > current_price]
                 
-            if support_levels and resistance_levels:
-                # Use the closest support and resistance levels
-                lower_price = max([s for s in support_levels if s < current_price], default=current_price * 0.97)
-                upper_price = min([r for r in resistance_levels if r > current_price], default=current_price * 1.03)
+                if not support_levels or not resistance_levels:
+                    # If we don't have levels on both sides, use default
+                    lower_price = current_price * 0.97
+                    upper_price = current_price * 1.03
+                else:
+                    # Goal: Find the strongest support and resistance that give us 
+                    # 0.5-1.0% grid spacing with at least 5 grids
+                    
+                    # Sort by distance from current price
+                    support_levels.sort(key=lambda x: current_price - x)  # Closest first
+                    resistance_levels.sort(key=lambda x: x - current_price)  # Closest first
+                    
+                    # Try all combinations of support and resistance levels
+                    best_combo = None
+                    best_score = float('inf')  # Lower score is better
+                    
+                    for s in support_levels:
+                        for r in resistance_levels:
+                            price_range_pct = (r - s) / s * 100
+                            
+                            # Calculate what grid spacing would be with various grid counts
+                            for grid_count in range(5, 101):  # Minimum 5 grids, max 100
+                                grid_spacing = price_range_pct / grid_count
+                                
+                                # Grid spacing should be between 0.5% and 1.0%
+                                if 0.5 <= grid_spacing <= 1.0:
+                                    # Calculate score (closer to 0.75% is better)
+                                    score = abs(grid_spacing - 0.75)
+                                    
+                                    if score < best_score:
+                                        best_score = score
+                                        best_combo = {
+                                            'support': s,
+                                            'resistance': r,
+                                            'grid_count': grid_count,
+                                            'grid_spacing': grid_spacing
+                                        }
+                    
+                    if best_combo:
+                        lower_price = best_combo['support']
+                        upper_price = best_combo['resistance']
+                        grid_count = best_combo['grid_count']
+                        grid_spacing = best_combo['grid_spacing']
+                    else:
+                        # No perfect combination found, try to adapt
+                        # Find the strongest support and resistance
+                        lower_price = support_levels[0]
+                        upper_price = resistance_levels[0]
+                        
+                        # Calculate range percentage
+                        price_range_pct = (upper_price - lower_price) / lower_price * 100
+                        
+                        # Determine optimal grid count for 0.75% spacing
+                        grid_count = max(5, round(price_range_pct / 0.75))
+                        grid_spacing = price_range_pct / grid_count
                 
-                # Save the levels for later use
-                self.support_levels = support_levels
-                self.resistance_levels = resistance_levels
-                
-                # Update price fields with the detected support/resistance levels
+                # Update UI with the selected values
                 self.lower_price.delete(0, tk.END)
                 self.upper_price.delete(0, tk.END)
                 self.lower_price.insert(0, f"{lower_price:.8f}")
                 self.upper_price.insert(0, f"{upper_price:.8f}")
-                self.lower_price.config(fg=self.lower_price.default_fg_color)
-                self.upper_price.config(fg=self.upper_price.default_fg_color)
                 
-                # Now calculate optimal grid number based on this range
-                price_diff_pct = (upper_price - lower_price) / lower_price
-                
-                # Adjust grid spacing based on volatility
-                if price_diff_pct > 0.10:  # >10% range
-                    self.grid_spacing_pct = 0.006  # 0.6% spacing
-                elif price_diff_pct > 0.05:  # 5-10% range
-                    self.grid_spacing_pct = 0.005  # 0.5% spacing
-                else:  # < 5% range
-                    self.grid_spacing_pct = 0.003  # 0.3% spacing
-                
-                # Calculate number of grids
-                num_grids = round(price_diff_pct / self.grid_spacing_pct)
-                num_grids = max(4, min(num_grids, 100))  # Ensure reasonable limits
-                
-                # Calculate actual spacing percentage
-                actual_spacing_pct = price_diff_pct / num_grids
-                
-                # Update grid number field
                 self.grid_number.delete(0, tk.END)
-                self.grid_number.insert(0, str(num_grids))
-                self.grid_number.config(fg=self.grid_number.default_fg_color)
+                self.grid_number.insert(0, str(grid_count))
                 
                 # Update spacing label
-                self.grid_spacing_label.config(text=f"Grid Spacing: ~{actual_spacing_pct*100:.2f}%")
+                self.grid_spacing_label.config(text=f"Grid Spacing: ~{grid_spacing:.2f}%")
                 
                 # Update profit estimate
-                self.update_profit_estimate(lower_price, upper_price, num_grids)
+                self.update_profit_estimate(lower_price, upper_price, grid_count)
                 
-                # Since we've just done a full calculation and update, don't show a separate message
-                # in this context - the UI has been updated with all calculated values
+                messagebox.showinfo("Grid Settings", 
+                                f"Support: {lower_price:.8f}\n"
+                                f"Resistance: {upper_price:.8f}\n" 
+                                f"Grid Count: {grid_count}\n"
+                                f"Grid Spacing: {grid_spacing:.2f}%")
             else:
-                # If no support/resistance found, use default values
-                lower_price = current_price * 0.97
-                upper_price = current_price * 1.03
-                
-                # Update price fields
-                self.lower_price.delete(0, tk.END)
-                self.upper_price.delete(0, tk.END)
-                self.lower_price.insert(0, f"{lower_price:.8f}")
-                self.upper_price.insert(0, f"{upper_price:.8f}")
-                self.lower_price.config(fg=self.lower_price.default_fg_color)
-                self.upper_price.config(fg=self.upper_price.default_fg_color)
-                
-                # Calculate a default grid number
-                price_diff_pct = (upper_price - lower_price) / lower_price
-                num_grids = round(price_diff_pct / 0.005)  # Use default 0.5% spacing
-                num_grids = max(4, min(num_grids, 50))
-                
-                # Update grid number field
-                self.grid_number.delete(0, tk.END)
-                self.grid_number.insert(0, str(num_grids))
-                self.grid_number.config(fg=self.grid_number.default_fg_color)
-                
-                # Update spacing label
-                actual_spacing_pct = price_diff_pct / num_grids
-                self.grid_spacing_label.config(text=f"Grid Spacing: ~{actual_spacing_pct*100:.2f}%")
-                
-                # Update profit estimate
-                self.update_profit_estimate(lower_price, upper_price, num_grids)
-                
-                messagebox.showinfo("Using Default Range", "No clear support/resistance found. Using default ±3% range.")
-                
+                # No detected levels, use default
+                messagebox.showinfo("Default Settings", "No clear support/resistance found. Using defaults.")
+                self._use_default_settings(current_price)
+        
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to calculate grid settings: {str(e)}")
-            self.grid_spacing_label.config(text="Grid Spacing: ~0.5%")  # Reset label
+            messagebox.showerror("Error", f"Failed to calculate grid settings: {e}")
+            self.grid_spacing_label.config(text="Grid Spacing: ~0.75%")  # Reset label
+    
+    def _use_default_settings(self, current_price):
+        """Apply default settings when support/resistance detection fails"""
+        # Set range to ±7.5% to allow for 0.75% spacing on 20 grids
+        lower_price = current_price * 0.925
+        upper_price = current_price * 1.075
+        grid_count = 20
+        grid_spacing = 0.75
+        
+        # Update UI
+        self.lower_price.delete(0, tk.END)
+        self.upper_price.delete(0, tk.END)
+        self.lower_price.insert(0, f"{lower_price:.8f}")
+        self.upper_price.insert(0, f"{upper_price:.8f}")
+        
+        self.grid_number.delete(0, tk.END)
+        self.grid_number.insert(0, str(grid_count))
+        
+        # Update spacing label
+        self.grid_spacing_label.config(text=f"Grid Spacing: ~{grid_spacing:.2f}%")
+        
+        # Update profit estimate
+        self.update_profit_estimate(lower_price, upper_price, grid_count)
     def update_grid_spacing(self, event=None):
         """Update grid spacing label when grid number changes"""
         try:
