@@ -120,159 +120,94 @@ class ExchangeClient:
             return False, 0.0, None, None, None, None
     
     def fetch_active_symbols(self):
-        """Fetch symbols that had ~20% movement and are now stable."""
+        """Fetch symbols with the highest gains or losses in the last 24 hours using 5-minute candles."""
         try:
             # Get market data
-            ticker_data = self.exchange.fetch_tickers()
             markets = self.exchange.load_markets()
             
+            # Select all USDT-settled futures markets, excluding BTC and ETH
             active_markets = [
                 symbol for symbol, market in markets.items()
                 if market.get('settle') == 'USDT' and market.get('swap') and 'BTC' not in symbol and 'ETH' not in symbol
             ]
             
-            active_markets_with_volume = [
-                symbol for symbol in active_markets 
-                if symbol in ticker_data and ticker_data[symbol].get('quoteVolume', 0) > 75000
-            ]
-            
-            # Time frames
+            # Time frame for exactly 24 hours (using 5m candles)
             now = int(time.time() * 1000)
-            stability_period = now - (4 * 60 * 60 * 1000)  # 4 hours for stability check
-            history_period = now - (14 * 24 * 60 * 60 * 1000)  # 14 days for historical movement
+            day_ago = now - (24 * 60 * 60 * 1000)  # Exactly 24 hours ago
             
-            pre_filtered_symbols = sorted(
-                active_markets_with_volume,
-                key=lambda x: ticker_data[x].get('quoteVolume', 0),
-                reverse=True
-            )[:100]
+            logger.info(f"Analyzing {len(active_markets)} markets for 24h movement using 5m candles")
             
-            logger.info(f"Analyzing {len(pre_filtered_symbols)} markets for movement + stability")
+            # Lists to store gainers and losers
+            gain_symbols = []
+            loss_symbols = []
             
-            suitable_symbols = []
-            target_movement_pct = 20.0
-            movement_margin = 5.0  # Accept 15-25% movement
-            
-            for symbol in pre_filtered_symbols:
+            for symbol in active_markets:
                 try:
-                    time.sleep(0.1)
+                    time.sleep(0.1)  # Rate limiting
                     
-                    # PART 1: Check historical significant movement
-                    history_ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe='4h', since=history_period, limit=84)
-                    if not history_ohlcv or len(history_ohlcv) < 30:
+                    # Fetch exactly 24 hours of 5-minute candles (288 candles = 24 hours)
+                    ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe='5m', since=day_ago, limit=288)
+                    
+                    if not ohlcv or len(ohlcv) < 200:  # Need sufficient data
                         continue
                     
-                    # Convert to simple arrays for faster processing
-                    highs = [candle[2] for candle in history_ohlcv]
-                    lows = [candle[3] for candle in history_ohlcv]
+                    # Get first and last candle for simple price comparison
+                    first_candle = ohlcv[0]
+                    last_candle = ohlcv[-1]
                     
-                    # Find max gain and loss
-                    max_gain_pct = 0
-                    max_loss_pct = 0
+                    # Use closing prices for accurate 24h comparison
+                    first_close = first_candle[4]
+                    last_close = last_candle[4]
                     
-                    # Calculate maximum gain (from any low to subsequent high)
-                    for i in range(len(lows) - 5):  # At least 5 candles between points
-                        low_price = lows[i]
-                        if low_price <= 0:
-                            continue
-                            
-                        for j in range(i + 5, len(highs)):
-                            gain_pct = (highs[j] - low_price) / low_price * 100
-                            max_gain_pct = max(max_gain_pct, gain_pct)
-                    
-                    # Calculate maximum loss (from any high to subsequent low)
-                    for i in range(len(highs) - 5):
-                        high_price = highs[i]
-                        if high_price <= 0:
-                            continue
-                            
-                        for j in range(i + 5, len(lows)):
-                            loss_pct = (lows[j] - high_price) / high_price * 100
-                            max_loss_pct = min(max_loss_pct, loss_pct)
-                    
-                    # Determine primary movement
-                    movement_type = "gain" if max_gain_pct >= abs(max_loss_pct) else "loss"
-                    movement_pct = max_gain_pct if movement_type == "gain" else abs(max_loss_pct)
-                    
-                    # Check if movement is within target range
-                    if not (target_movement_pct - movement_margin <= movement_pct <= target_movement_pct + movement_margin):
+                    if first_close <= 0:  # Avoid division by zero
                         continue
                     
-                    # PART 2: Verify CURRENT stability
-                    recent_ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe='5m', since=stability_period, limit=48)
-                    if not recent_ohlcv or len(recent_ohlcv) < 20:
-                        continue
+                    # Calculate 24h percentage change
+                    pct_change = ((last_close - first_close) / first_close) * 100
                     
-                    # Extract recent prices
-                    recent_highs = [candle[2] for candle in recent_ohlcv]
-                    recent_lows = [candle[3] for candle in recent_ohlcv]
-                    recent_closes = [candle[4] for candle in recent_ohlcv]
-                    
-                    # Calculate stability metrics
-                    current_range_pct = (max(recent_highs) - min(recent_lows)) / (sum(recent_closes) / len(recent_closes)) * 100
-                    
-                    # Check candle sizes
-                    candle_sizes = [(recent_highs[i] - recent_lows[i]) / recent_closes[i] * 100 
-                                for i in range(len(recent_ohlcv))]
-                    avg_candle_size = sum(candle_sizes) / len(candle_sizes)
-                    max_candle_size = max(candle_sizes)
-                    
-                    # Calculate price changes between candles
-                    price_changes = [abs((recent_closes[i] - recent_closes[i-1]) / recent_closes[i-1] * 100) 
-                                    for i in range(1, len(recent_closes))]
-                    max_price_change = max(price_changes)
-                    
-                    # STRICT stability criteria - must meet ALL conditions
-                    is_stable = (
-                        current_range_pct < 4.0 and  # Less than 4% total range in recent period
-                        avg_candle_size < 0.7 and    # Average candle size under 0.7%
-                        max_candle_size < 1.5 and    # No single candle over 1.5%
-                        max_price_change < 0.8       # No sharp price changes over 0.8%
-                    )
-                    
-                    if not is_stable:
-                        continue
-                    
-                    # Symbol passed both significant movement AND current stability
-                    stability_score = (
-                        0.4 * current_range_pct/4.0 +    # Normalized range (0-1)
-                        0.3 * avg_candle_size/0.7 +      # Normalized avg candle (0-1)
-                        0.2 * max_candle_size/1.5 +      # Normalized max candle (0-1)
-                        0.1 * max_price_change/0.8       # Normalized price change (0-1)
-                    )
-                    
-                    suitable_symbols.append({
-                        'symbol': symbol,
-                        'stability_score': stability_score,
-                        'movement_type': movement_type,
-                        'movement_pct': movement_pct,
-                        'current_range': current_range_pct,
-                        'avg_candle': avg_candle_size,
-                        'max_candle': max_candle_size
-                    })
+                    # Determine if it's a gain or loss
+                    if pct_change > 0:
+                        # It's a gain
+                        gain_symbols.append({
+                            'symbol': symbol,
+                            'movement_type': "gain",
+                            'movement_pct': pct_change
+                        })
+                    elif pct_change < 0:
+                        # It's a loss (store absolute value)
+                        loss_symbols.append({
+                            'symbol': symbol,
+                            'movement_type': "loss",
+                            'movement_pct': abs(pct_change)
+                        })
                     
                 except Exception as e:
                     logger.debug(f"Error analyzing {symbol}: {e}")
                     continue
             
-            if not suitable_symbols:
-                logger.warning("No symbols found with significant movement and current stability")
-                return []
+            # Sort gain symbols by highest percentage (descending)
+            sorted_gain_symbols = sorted(gain_symbols, key=lambda x: x['movement_pct'], reverse=True)
             
-            # Sort by stability (most stable first)
-            sorted_symbols = sorted(suitable_symbols, key=lambda x: x['stability_score'])
+            # Sort loss symbols by highest percentage (descending)
+            sorted_loss_symbols = sorted(loss_symbols, key=lambda x: x['movement_pct'], reverse=True)
             
-            # Take top 30 most stable symbols that had significant movement
-            result_symbols = [item['symbol'] for item in sorted_symbols[:30]]
+            # Take top 15 from each category (or fewer if not available)
+            max_per_category = 15
+            top_gains = sorted_gain_symbols[:max_per_category]
+            top_losses = sorted_loss_symbols[:max_per_category]
+            
+            # Combine gainers and losers with gains first
+            sorted_symbols = top_gains + top_losses
             
             # Log the results
+            logger.info(f"Found {len(top_gains)} gainers and {len(top_losses)} losers")
             for i, item in enumerate(sorted_symbols[:10]):
                 logger.info(
-                    f"{i+1}. {item['symbol']}: {item['movement_type'].capitalize()}={item['movement_pct']:.1f}%, "
-                    f"Now Stable: Range={item['current_range']:.2f}%, "
-                    f"AvgCandle={item['avg_candle']:.2f}%"
+                    f"{i+1}. {item['symbol']}: {item['movement_type'].capitalize()}={item['movement_pct']:.1f}%"
                 )
             
+            # Return the symbols without the metadata
+            result_symbols = [item['symbol'] for item in sorted_symbols[:30]]
             return result_symbols
             
         except Exception as e:
